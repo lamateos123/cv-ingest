@@ -2,3 +2,5 @@ fastapi==0.115.*
 uvicorn==0.30.*
 azure-storage-blob==12.*
 azure-cosmos==4.*
+python-multipart>=0.0.9
+
