@@ -1,89 +1,97 @@
-import io, os, json, uuid, hashlib, datetime as dt
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+import os, json, uuid
+from pathlib import Path
+from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from azure.cosmos import CosmosClient
+from azure.cosmos import CosmosClient, PartitionKey
 
 app = FastAPI()
 
-ALLOWED = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+def get_api_token() -> str:
+    tok = os.environ.get("API_TOKEN")
+    if not tok:
+        raise RuntimeError("API_TOKEN not set")
+    return tok
 
-def need_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise HTTPException(500, f"Server missing required env var: {name}")
-    return v
+def bearer_auth(authorization: str | None = Header(default=None)) -> None:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer")
+    supplied = authorization.split(" ", 1)[1]
+    if supplied != get_api_token():
+        raise HTTPException(status_code=403, detail="bad token")
 
-def get_blob_container():
-    conn = need_env("BLOB_CONN_STR")
-    container_name = os.getenv("BLOB_CONTAINER", "images")
+def get_blob_clients():
+    # Prefer explicit connection string
+    conn = os.environ.get("BLOB_CONN_STR") or os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn:
+        raise RuntimeError("Blob connection string missing (BLOB_CONN_STR or AZURE_STORAGE_CONNECTION_STRING)")
     svc = BlobServiceClient.from_connection_string(conn)
-    return svc.get_container_client(container_name)
+    container_name = os.environ.get("BLOB_CONTAINER", "images")
+    container = svc.get_container_client(container_name)
+    try:
+        container.create_container()  # idempotent
+    except Exception:
+        pass
+    return container
 
 def get_cosmos_container():
-    ep = need_env("COSMOS_ENDPOINT")
-    key = need_env("COSMOS_KEY")
-    dbname = os.getenv("COSMOS_DB", "cv")
-    cname = os.getenv("COSMOS_CONTAINER", "ingest")
+    ep = os.environ.get("COSMOS_ENDPOINT")
+    key = os.environ.get("COSMOS_KEY")
+    if not ep or not key:
+        return None
     client = CosmosClient(ep, key)
-    db = client.get_database_client(dbname)
-    return db.get_container_client(cname)
+    db = client.create_database_if_not_exists(id=os.environ.get("COSMOS_DB", "cv"))
+    cont = db.create_container_if_not_exists(
+        id=os.environ.get("COSMOS_CONTAINER", "ingest"),
+        partition_key=PartitionKey(path="/barcode"),
+        offer_throughput=400,
+    )
+    return cont
 
 @app.get("/healthz")
 def healthz():
-    # no Azure calls here; always up if the server runs
     return {"ok": True}
 
-@app.post("/ingest")
-async def ingest(
-    file: UploadFile = File(...),
-    meta: str = Form(...),
-    authorization: str | None = Header(default=None),
-):
-    api_token = os.getenv("API_TOKEN")
-    if api_token:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(401, "missing bearer")
-        if authorization.split(" ", 1)[1] != api_token:
-            raise HTTPException(403, "bad token")
-
-    if file.content_type not in ALLOWED:
-        raise HTTPException(415, "unsupported content type")
-
+@app.post("/ingest", dependencies=[Depends(bearer_auth)])
+async def ingest(file: UploadFile = File(...), meta: str = Form(...)):
+    # Parse meta JSON (expects camera_id, ts (ISO), barcode)
     try:
-        meta_obj = json.loads(meta)
+        m = json.loads(meta)
     except Exception:
-        raise HTTPException(400, "meta must be JSON")
+        raise HTTPException(status_code=400, detail="meta must be JSON")
+
+    camera = (m.get("camera_id") or "unknown").strip()
+    ts_raw = (m.get("ts") or "").strip()
+    barcode = (m.get("barcode") or "").strip()
+
+    # sanitize for name
+    ext = Path(file.filename or "").suffix or ".bin"
+    safe_ts = ts_raw.replace(":", "").replace("/", "-").replace(" ", "T")
+    blob_name = f"{camera}-{safe_ts}-{barcode}-{uuid.uuid4().hex}{ext}"
 
     data = await file.read()
-    if not data:
-        raise HTTPException(400, "empty file")
 
-    ext = ALLOWED[file.content_type]
-    md5 = hashlib.md5(data).hexdigest()
-    path = f"ingest/{dt.datetime.utcnow():%Y/%m/%d}/{uuid.uuid4().hex}{ext}"
-
-    # do the Azure work only here
-    blob_container = get_blob_container()
-    blob_container.upload_blob(
-        name=path,
-        data=io.BytesIO(data),
-        overwrite=False,
-        content_settings=ContentSettings(content_type=file.content_type),
+    # Upload to Blob
+    container = get_blob_clients()
+    container.upload_blob(
+        name=blob_name,
+        data=data,
+        overwrite=True,
+        content_settings=ContentSettings(content_type=file.content_type or "application/octet-stream"),
     )
 
-    cosmos_container = get_cosmos_container()
+    # Write metadata to Cosmos (best-effort; blob already uploaded)
+    cont = get_cosmos_container()
     doc = {
-        "id": uuid.uuid4().hex,
-        "blob_account": os.getenv("BLOB_ACCOUNT"),
-        "blob_container": os.getenv("BLOB_CONTAINER", "images"),
-        "blob_path": path,
+        "id": str(uuid.uuid4()),
+        "camera_id": camera,
+        "ts": ts_raw or datetime.utcnow().isoformat() + "Z",
+        "barcode": barcode or "unknown",
+        "blob": blob_name,
         "size": len(data),
-        "content_type": file.content_type,
-        "md5": md5,
-        "meta": meta_obj,
-        "ts": dt.datetime.utcnow().isoformat() + "Z",
-        "camera_id": str(meta_obj.get("camera_id", "unknown")),
     }
-    cosmos_container.upsert_item(doc)
-    return JSONResponse({"ok": True, "blob_path": path, "doc_id": doc["id"], "md5": md5})
+    if cont:
+        cont.upsert_item(doc)
+
+    return JSONResponse({"ok": True, "blob": blob_name, "doc": doc})
