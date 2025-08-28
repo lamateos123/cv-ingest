@@ -2,5 +2,4 @@ fastapi
 uvicorn[standard]
 azure-storage-blob
 azure-cosmos
-pillow
-python-multipart>=0.0.9
+python-multipart
